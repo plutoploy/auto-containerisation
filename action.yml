@@ -1,70 +1,43 @@
-name: "Auto Containerize with GitHub Models"
-description: "Analyzes the codebase and uses GitHub Models to generate a Containerfile recipe, saving it to GITHUB_ENV."
+# .github/workflows/ollama.yml
 
-permissions:
-  contents: read
-  models: read
-  workflow: read
-
-on:
+name: generate container recepie.
+on: 
   workflow_dispatch:
-    inputs:
-      model:
-        description: "The GitHub model ID to use (e.g., gpt-4o, meta-llama-3-8b-instruct)"
-        required: false
-        default: "meta/Llama-3.3-70B-Instruct"
-      prompt:
-        description: "Custom instructions for the model"
-        required: false
-        default: "Based on the provided repository files, generate a Containerfile return ONLY the raw containerfile content. Do not wrap it in markdown code blocks. Do not add any explanations. Also keep the image size as small as possible."
 
-runs:
-  using: "composite"
-  steps:
-    - name: Setup gh models extension
-      shell: bash
-      run: |
-        gh extension install github/gh-models || true
-      env:
-        GH_TOKEN: ${{ github.token }}
+jobs:
+  detect-and-generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: action/checkout@main
 
-    - name: Gather Project Context
-      id: context
-      shell: bash
-      run: |
-        CONTEXT_FILE=$(mktemp)
-        echo "Project directory structure:" > "$CONTEXT_FILE"
-        find . -maxdepth 2 -not -path '*/\.*' | head -n 50 >> "$CONTEXT_FILE"
-        echo "" >> "$CONTEXT_FILE"
+      - name: detect codebase type
+        uses: ai-action/ollama-action@master
+        id: detect
+        with:
+          model: gemma4:12b
+          prompt: "analyze this repository and return ONLY a JSON object with keys: language, framework, package_manager, entrypoint, port. Example: {\"language\":\"python\",\"framework\":\"fastapi\",\"package_manager\":\"pip\",\"entrypoint\":\"main:app\",\"port\":8000}"
 
-        echo "Relevant configuration and dependency files:" >> "$CONTEXT_FILE"
-        for f in package.json requirements.txt pom.xml build.gradle go.mod Gemfile; do
-          if [ -f "$f" ]; then
-            echo "--- $f ---" >> "$CONTEXT_FILE"
-            cat "$f" >> "$CONTEXT_FILE"
-            echo "" >> "$CONTEXT_FILE"
-          fi
-        done
+      - name: generate container recepie
+        uses: ai-action/ollama-action@master
+        id: model
+        with:
+          model: gemma4:12b
+          prompt: "generate a Dockerfile for this project. Detection result: ${{ steps.detect.outputs.response }}. Requirements: use multi-stage build, minimize image size, use alpine or distroless base, don't reply in markup, just give the raw Dockerfile"
 
-    - name: Generate Container Recipe
-      id: generate
-      shell: bash
-      env:
-        INPUT_MODEL: ${{ inputs.model }}
-        INPUT_PROMPT: ${{ inputs.prompt }}
-      run: |
-        CONTEXT_FILE="${{ steps.context.outputs.context_file }}"
-        RECIPE=$(cat "$CONTEXT_FILE" | gh models run "$INPUT_MODEL" "$INPUT_PROMPT")
-        RECIPE=$(echo "$RECIPE" | sed '/^```/d')
-        EOF=$(openssl rand -hex 8)
+      - name: validate dockerfile
+        run: |
+          echo "$response" | head -1 | grep -q "^FROM" || { echo "ERROR: Invalid Dockerfile - must start with FROM"; exit 1; }
+          echo "$response" | grep -q "CMD\|ENTRYPOINT" || { echo "ERROR: Invalid Dockerfile - no CMD or ENTRYPOINT found"; exit 1; }
+          echo "$response" | grep -q "COPY\|ADD" || { echo "WARNING: No COPY/ADD found - check if files are copied correctly"; }
+        env:
+          response: ${{ steps.model.outputs.response }}
 
-        1. Store in GITHUB_ENV so subsequent steps in the same job can reference $
-        echo "CONTAINER_RECIPE<<$EOF" >> "$GITHUB_ENV"
-        echo "$RECIPE" >> "$GITHUB_ENV"
-        echo "$EOF" >> "$GITHUB_ENV"
+      - name: save response
+        run: |
+          echo "$response"
+          gh secret set PLUTOPLOY_RECEPIE "$response"
+        env:
+          response: ${{ steps.model.outputs.response }}
+          GITHUB_TOKEN: ${{ github.token }}
 
-    - name: store context file
-      shell: bash
-      run: |
-        gh secret set WORKFLOW_RECIPE --body "$RECIPE"
-        rm -f "$CONTEXT_FILE"

@@ -83,11 +83,14 @@ jobs:
         id: detect
         with:
           model: deepseek-coder-v2:16b
-          prompt: >
+          prompt: |
             You are given the following codebase context. Analyze the file tree, configuration files,
             and source code to determine the project's language/framework/build system.
             Return ONLY one of these exact keywords: go, node, fastapi, python, java, rust, ruby, php, dotnet
             No explanation, no commentary, just the single keyword.
+
+            CODEBASE CONTEXT:
+            ${{ steps.context.outputs.content }}
 
       - name: select Containerfile
         run: |
@@ -122,24 +125,24 @@ jobs:
         run: |
           if [ ! -f .dockerignore ]; then
             cat > .dockerignore << 'DOCKERIGNORE'
-            .git
-            .github
-            node_modules
-            __pycache__
-            .venv
-            venv
-            .mypy_cache
-            .pytest_cache
-            .ruff_cache
-            *.pyc
-            .env
-            .env.*
-           !.env.example
-            target
-            Cargo.lock
-            *.tar.gz
-            .DS_Store
-            DOCKERIGNORE
+          .git
+          .github
+          node_modules
+          __pycache__
+          .venv
+          venv
+          .mypy_cache
+          .pytest_cache
+          .ruff_cache
+          *.pyc
+          .env
+          .env.*
+          !.env.example
+          target
+          Cargo.lock
+          *.tar.gz
+          .DS_Store
+          DOCKERIGNORE
             echo "Created .dockerignore"
           else
             echo ".dockerignore already exists"

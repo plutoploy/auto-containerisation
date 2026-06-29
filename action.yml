@@ -1,0 +1,201 @@
+name: Auto Containerisation
+description: Automatically detect project type and generate a Containerfile
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  model:
+    description: 'Ollama model to use for codebase detection'
+    required: false
+    default: 'deepseek-coder-v2:16b'
+  commit-message:
+    description: 'Commit message for the generated Containerfile'
+    required: false
+    default: 'chore: generate Containerfile via plutoploy bot'
+  bot-name:
+    description: 'Git author name for commits'
+    required: false
+    default: 'plutoploy-gh[bot]'
+  bot-email:
+    description: 'Git author email for commits'
+    required: false
+    default: 'plutoploy-gh-bot[bot]@users.noreply.github.com'
+
+runs:
+  using: composite
+  steps:
+    - name: check for existing containerfile
+      id: existing
+      shell: bash
+      run: |
+        if [ -f "Containerfile" ] || [ -f "Dockerfile" ]; then
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "NOTE: A Containerfile or Dockerfile already exists in this repository."
+        else
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: gather codebase context
+      id: context
+      shell: bash
+      run: |
+        {
+          echo "REPOSITORY FILE TREE:"
+          find . -type f -not -path './.git/*' -not -path './.vscode/*' -not -path './public/*' -not -path './.github/*' | sort | head -150
+          echo ""
+          echo "KEY CONFIGURATION FILES"
+          for file in package.json requirements.txt pyproject.toml Cargo.toml go.mod pom.xml build.gradle Gemfile composer.json Makefile Justfile Taskfile.yaml; do
+            if [ -f "$file" ]; then
+              echo ""
+              echo "--- $file ---"
+              cat "$file"
+            fi
+          done
+          echo ""
+          echo "KNOWN ENTRY POINTS (full contents):"
+          for entry in main.py app.py manage.py server.py index.ts server.ts main.go cmd/main.go main.rs src/main.rs src/bin/*.rs src/lib.rs pubspec.yaml Application.java Main.java; do
+            if [ -f "$entry" ]; then
+              echo ""
+              echo "=== $entry (FULL) ==="
+              cat "$entry"
+            fi
+          done
+          echo ""
+          echo "OTHER SOURCE FILES (first 40 lines each):"
+          find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.rb" -o -name "*.php" \) \
+            -not -path './.git/*' -not -name "main.py" -not -name "app.py" -not -name "index.ts" -not -name "server.ts" -not -name "main.go" -not -name "main.rs" \
+            | head -15 | while read -r f; do
+              echo ""
+              echo "=== $f ==="
+              head -n 10 "$f"
+            done
+        } > repo_context.txt
+        total=0
+        while IFS= read -r line; do
+          linelen=${#line}
+          if [ $((total + linelen + 1)) -le 12000 ]; then
+            echo "$line"
+            total=$((total + linelen + 1))
+          else
+            break
+          fi
+        done < repo_context.txt > repo_context_trimmed.txt
+
+        delimiter="EOF_$(date +%s)_$$"
+        {
+          echo "content<<${delimiter}"
+          cat repo_context_trimmed.txt
+          echo
+          echo "${delimiter}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: detect codebase type
+      uses: ai-action/ollama-action@master
+      id: detect
+      with:
+        model: ${{ inputs.model }}
+        prompt: |
+          You are given the following codebase context. Analyze the file tree, configuration files,
+          and source code to determine the project's language/framework/build system.
+          Return ONLY one of these exact keywords: go, node, fastapi, python, java, rust, ruby, php, dotnet
+          No explanation, no commentary, just the single keyword.
+
+          CODEBASE CONTEXT:
+          ${{ steps.context.outputs.content }}
+
+    - name: select Containerfile
+      shell: bash
+      run: |
+        type="${{ steps.detect.outputs.response }}"
+        type=$(echo "$type" | tr -d '[:space:]')
+
+        if [ ! -f "${type}.Containerfile" ]; then
+          echo "ERROR: No template found for '${type}'. Available templates:"
+          ls *.Containerfile
+          exit 1
+        fi
+
+        cp "${type}.Containerfile" Containerfile
+        echo "Selected template: ${type}.Containerfile"
+
+    - name: validate Containerfile structure
+      shell: bash
+      run: |
+        echo "---  ---"
+        cat Containerfile
+        echo "------------------------------"
+
+        if ! grep -qE '^FROM ' Containerfile; then
+          echo "ERROR: No FROM instruction found"
+          exit 1
+        fi
+        if ! grep -qE '^(CMD|ENTRYPOINT)' Containerfile; then
+          echo "ERROR: No CMD or ENTRYPOINT instruction found"
+          exit 1
+        fi
+
+    - name: ensure .dockerignore exists
+      shell: bash
+      run: |
+        if [ ! -f .dockerignore ]; then
+          cat > .dockerignore << 'DOCKERIGNORE'
+        .git
+        .github
+        node_modules
+        __pycache__
+        .venv
+        venv
+        .mypy_cache
+        .pytest_cache
+        .ruff_cache
+        *.pyc
+        .env
+        .env.*
+        !.env.example
+        target
+        Cargo.lock
+        *.tar.gz
+        .DS_Store
+        DOCKERIGNORE
+          echo "Created .dockerignore"
+        else
+          echo ".dockerignore already exists"
+        fi
+
+    - name: verify Containerfile builds
+      shell: bash
+      run: |
+        if command -v buildah &> /dev/null; then
+          buildah bud --layers=false -f Containerfile . && echo "Build verification passed." || {
+            echo "WARNING: Containerfile failed build verification."
+            echo "The file will still be included in the PR for manual review."
+          }
+        elif command -v docker &> /dev/null; then
+          docker build --no-cache -f Containerfile . && echo "Build verification passed." || {
+            echo "WARNING: Containerfile failed build verification."
+            echo "The file will still be included in the PR for manual review."
+          }
+        else
+          echo "SKIP: Neither buildah nor docker available for build verification."
+        fi
+
+    - name: create branch and commit
+      shell: bash
+      run: |
+        git config user.name "${{ inputs.bot-name }}"
+        git config user.email "${{ inputs.bot-email }}"
+        git add Containerfile .dockerignore
+        git diff --cached --quiet && echo "No changes to commit" && echo "changed=false" >> "$GITHUB_OUTPUT" && exit 0
+
+        git commit -m "${{ inputs.commit-message }}"
+        git push
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+
+outputs:
+  detected-type:
+    description: 'The detected project type'
+    value: ${{ steps.detect.outputs.response }}
+  changed:
+    description: 'Whether new files were committed'
+    value: ${{ steps.context.outputs.changed }}

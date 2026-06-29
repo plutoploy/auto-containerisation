@@ -1,9 +1,9 @@
-FROM rust:latest as builder
+FROM docker.io/rust:latest as builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM docker.io/debian:bookworm-slim
 WORKDIR /app
 COPY --from=builder /app/target/release/app .
 CMD ["./app"]

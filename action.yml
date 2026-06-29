@@ -1,42 +1,175 @@
-# .github/workflows/ollama.yml
+name: plutoploy bot
 
-name: generate container recepie.
-on: 
+on:
   workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   detect-and-generate:
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: action/checkout@main
+        uses: actions/checkout@main
+        with:
+          token: ${{ github.token }}
+      - name: check for existing containerfile
+        id: existing
+        run: |
+          if [ -f "Containerfile" ] || [ -f "Dockerfile" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "NOTE: A Containerfile or Dockerfile already exists in this repository."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: gather codebase context
+        id: context
+        run: |
+          {
+            echo "REPOSITORY FILE TREE:"
+            find . -type f -not -path './.git/*' -not -path './.vscode/*' -not -path './public/*' -not -path './.github/*' | sort | head -150
+            echo ""
+            echo "KEY CONFIGURATION FILES"
+            for file in package.json requirements.txt pyproject.toml Cargo.toml go.mod pom.xml build.gradle Gemfile composer.json Makefile Justfile Taskfile.yaml; do
+              if [ -f "$file" ]; then
+                echo ""
+                echo "--- $file ---"
+                cat "$file"
+              fi
+            done
+            echo ""
+            echo "KNOWN ENTRY POINTS (full contents):"
+            for entry in main.py app.py manage.py server.py index.ts server.ts main.go cmd/main.go main.rs src/main.rs src/bin/*.rs src/lib.rs pubspec.yaml Application.java Main.java; do
+              if [ -f "$entry" ]; then
+                echo ""
+                echo "=== $entry (FULL) ==="
+                cat "$entry"
+              fi
+            done
+            echo ""
+            echo "OTHER SOURCE FILES (first 40 lines each):"
+            find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.rb" -o -name "*.php" \) \
+              -not -path './.git/*' -not -name "main.py" -not -name "app.py" -not -name "index.ts" -not -name "server.ts" -not -name "main.go" -not -name "main.rs" \
+              | head -15 | while read -r f; do
+                echo ""
+                echo "=== $f ==="
+                head -n 10 "$f"
+              done
+          } > repo_context.txt
+          total=0
+          while IFS= read -r line; do
+            linelen=${#line}
+            if [ $((total + linelen + 1)) -le 12000 ]; then
+              echo "$line"
+              total=$((total + linelen + 1))
+            else
+              break
+            fi
+          done < repo_context.txt > repo_context_trimmed.txt
+
+          delimiter="EOF_$(date +%s)_$$"
+          {
+            echo "content<<${delimiter}"
+            cat repo_context_trimmed.txt
+            echo
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: detect codebase type
         uses: ai-action/ollama-action@master
         id: detect
         with:
-          model: gemma4:12b
-          prompt: "analyze this repository and return ONLY a JSON object with keys: language, framework, package_manager, entrypoint, port. Example: {\"language\":\"python\",\"framework\":\"fastapi\",\"package_manager\":\"pip\",\"entrypoint\":\"main:app\",\"port\":8000}"
+          model: deepseek-coder-v2:16b
+          prompt: >
+            You are given the following codebase context. Analyze the file tree, configuration files,
+            and source code to determine the project's language/framework/build system.
+            Return ONLY one of these exact keywords: go, node, fastapi, python, java, rust, ruby, php, dotnet
+            No explanation, no commentary, just the single keyword.
 
-      - name: generate container recepie
-        uses: ai-action/ollama-action@master
-        id: model
-        with:
-          model: gemma4:12b
-          prompt: "generate a Dockerfile for this project. Detection result: ${{ steps.detect.outputs.response }}. Requirements: use multi-stage build, minimize image size, use alpine or distroless base, don't reply in markup, just give the raw Dockerfile"
-
-      - name: validate dockerfile
+      - name: select Containerfile
         run: |
-          echo "$response" | head -1 | grep -q "^FROM" || { echo "ERROR: Invalid Dockerfile - must start with FROM"; exit 1; }
-          echo "$response" | grep -q "CMD\|ENTRYPOINT" || { echo "ERROR: Invalid Dockerfile - no CMD or ENTRYPOINT found"; exit 1; }
-          echo "$response" | grep -q "COPY\|ADD" || { echo "WARNING: No COPY/ADD found - check if files are copied correctly"; }
-        env:
-          response: ${{ steps.model.outputs.response }}
+          type="${{ steps.detect.outputs.response }}"
+          type=$(echo "$type" | tr -d '[:space:]')
 
-      - name: save response
+          if [ ! -f "${type}.Containerfile" ]; then
+            echo "ERROR: No template found for '${type}'. Available templates:"
+            ls *.Containerfile
+            exit 1
+          fi
+
+          cp "${type}.Containerfile" Containerfile
+          echo "Selected template: ${type}.Containerfile"
+
+      - name: validate Containerfile structure
         run: |
-          echo "$response"
-          gh secret set PLUTOPLOY_RECEPIE "$response"
-        env:
-          response: ${{ steps.model.outputs.response }}
-          GITHUB_TOKEN: ${{ github.token }}
+          echo "---  ---"
+          cat Containerfile
+          echo "------------------------------"
+
+          if ! grep -qE '^FROM ' Containerfile; then
+            echo "ERROR: No FROM instruction found"
+            exit 1
+          fi
+          if ! grep -qE '^(CMD|ENTRYPOINT)' Containerfile; then
+            echo "ERROR: No CMD or ENTRYPOINT instruction found"
+            exit 1
+          fi
+
+      - name: ensure .dockerignore exists
+        run: |
+          if [ ! -f .dockerignore ]; then
+            cat > .dockerignore << 'DOCKERIGNORE'
+            .git
+            .github
+            node_modules
+            __pycache__
+            .venv
+            venv
+            .mypy_cache
+            .pytest_cache
+            .ruff_cache
+            *.pyc
+            .env
+            .env.*
+           !.env.example
+            target
+            Cargo.lock
+            *.tar.gz
+            .DS_Store
+            DOCKERIGNORE
+            echo "Created .dockerignore"
+          else
+            echo ".dockerignore already exists"
+          fi
+
+      - name: verify Containerfile builds
+        run: |
+          if command -v buildah &> /dev/null; then
+            buildah bud --layers=false -f Containerfile . && echo "Build verification passed." || {
+              echo "WARNING: Containerfile failed build verification."
+              echo "The file will still be included in the PR for manual review."
+            }
+          elif command -v docker &> /dev/null; then
+            docker build --no-cache -f Containerfile . && echo "Build verification passed." || {
+              echo "WARNING: Containerfile failed build verification."
+              echo "The file will still be included in the PR for manual review."
+            }
+          else
+            echo "SKIP: Neither buildah nor docker available for build verification."
+          fi
+
+      - name: create branch and commit
+        id: commit
+        run: |
+          git config user.name "plutoploy-gh[bot]"
+          git config user.email "plutoploy-gh-bot[bot]@users.noreply.github.com"
+          git add Containerfile .dockerignore
+          git diff --cached --quiet && echo "No changes to commit" && echo "changed=false" >> "$GITHUB_OUTPUT" && exit 0
+
+          git commit -m "chore: generate Containerfile via plutoploy bot"
+          git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          # echo "branch=$branch" >> "$GITHUB_OUTPUT"

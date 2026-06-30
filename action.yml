@@ -107,9 +107,28 @@ runs:
     - name: select Containerfile
       shell: bash
       run: |
-        type="${{ steps.detect.outputs.response }}"
-        type=$(echo "$type" | tr -d '[:space:]')
+        raw="${{ steps.detect.outputs.response }}"
+        # strip ANSI escape codes, take first line, trim whitespace
+        type=$(echo "$raw" | sed 's/\x1b\[[0-9;]*m//g' | head -n1 | tr -d '[:space:]')
 
+        valid="go node fastapi python java rust ruby php dotnet"
+        matched=""
+        for v in $valid; do
+          if [ "$type" = "$v" ]; then
+            matched="$v"
+            break
+          fi
+        done
+
+        if [ -z "$matched" ]; then
+          echo "ERROR: Could not detect project type. Raw output:"
+          echo "$raw"
+          echo "Available templates:"
+          ls *.Containerfile
+          exit 1
+        fi
+
+        type="$matched"
         if [ ! -f "${type}.Containerfile" ]; then
           echo "ERROR: No template found for '${type}'. Available templates:"
           ls *.Containerfile

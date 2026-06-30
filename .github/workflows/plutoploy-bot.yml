@@ -87,6 +87,7 @@ jobs:
             You are given the following codebase context. Analyze the file tree, configuration files,
             and source code to determine the project's language/framework/build system.
             Return ONLY one of these exact keywords: go, node, fastapi, python, java, rust, ruby, php, dotnet
+            NOTE: For Svelte, SvelteKit, Vite projects → return node
             No explanation, no commentary, just the single keyword.
 
             CODEBASE CONTEXT:

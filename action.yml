@@ -108,8 +108,31 @@ runs:
       shell: bash
       run: |
         raw="${{ steps.detect.outputs.response }}"
-        # strip ANSI escape codes, take first line, trim whitespace
-        type=$(echo "$raw" | sed 's/\x1b\[[0-9;]*m//g' | head -n1 | tr -d '[:space:]')
+        # strip ANSI escape codes, extract keyword from response
+        clean=$(echo "$raw" | sed 's/\x1b\[[0-9;]*m//g')
+        
+        # Try to extract single keyword from lines containing exactly one valid keyword
+        type=""
+        valid_keywords="go node fastapi python java rust ruby php dotnet"
+        while IFS= read -r line; do
+          trimmed=$(echo "$line" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          for kw in $valid_keywords; do
+            if [ "$trimmed" = "$kw" ]; then
+              type="$kw"
+              break 2
+            fi
+          done
+        done <<< "$clean"
+        
+        # Fallback: if no exact match, try grep for keyword anywhere in output
+        if [ -z "$type" ]; then
+          for kw in $valid_keywords; do
+            if echo "$clean" | grep -qi "\b${kw}\b"; then
+              type="$kw"
+              break
+            fi
+          done
+        fi
 
         valid="go node fastapi python java rust ruby php dotnet"
         matched=""
@@ -129,13 +152,14 @@ runs:
         fi
 
         type="$matched"
-        if [ ! -f "${type}.Containerfile" ]; then
+        template_path="${{ github.action_path }}/${type}.Containerfile"
+        if [ ! -f "$template_path" ]; then
           echo "ERROR: No template found for '${type}'. Available templates:"
-          ls *.Containerfile
+          ls "${{ github.action_path }}"/*.Containerfile
           exit 1
         fi
 
-        cp "${type}.Containerfile" Containerfile
+        cp "$template_path" Containerfile
         echo "Selected template: ${type}.Containerfile"
 
     - name: validate Containerfile structure
